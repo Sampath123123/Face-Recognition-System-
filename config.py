@@ -19,7 +19,7 @@ GOOGLE_CREDS_FILE = 'credentials.json'
 # Find this ID in the URL of your "Known Faces" Google Sheet:
 # e.g., https://docs.google.com/spreadsheets/d/THIS_IS_THE_ID/edit
 # Paste the ID inside the quotes below. If filled, SHEET_NAME is ignored.
-GOOGLE_SHEET_ID = "1M49zBvB13u1mKXSY0FphLEBOB4yU2A_zqS9OjT2BDrk"  # <<< PASTE THE ID of "Known Faces" sheet HERE
+GOOGLE_SHEET_ID = "YOUR_SHEET_ID " # <<< PASTE THE ID of "Known Faces" sheet HERE
 
 # OPTION 2: Use Sheet Name (Fallback if SHEET_ID is None or fails)
 # The exact name of your target Google Sheet document.
@@ -34,7 +34,7 @@ GOOGLE_WORKSHEET_NAME = 'Sheet1' # <<< Usually 'Sheet1', change if needed
 # Your Google Generative AI (Gemini) API Key. Get from Google AI Studio.
 # IMPORTANT: Keep this key secret! Do not share it publicly.
 # !!! Replace "YOUR_GEMINI_API_KEY_HERE" with your actual key !!!
-GEMINI_API_KEY = "AIzaSyAq2RnjENjhJ43kboM809JaiP5No36kziw"
+GEMINI_API_KEY = "YOUR_API_ASS_DICK_KEY"
 
 
 # --- Face Recognition Settings ---
