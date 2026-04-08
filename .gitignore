@@ -1,0 +1,11 @@
+.venv/
+__pycache__/
+*.pyc
+.DS_Store
+
+alerts/*.jpg
+alerts/*.png
+alerts/*.jpeg
+!alerts/.gitkeep
+
+database/.~lock.officers.csv#

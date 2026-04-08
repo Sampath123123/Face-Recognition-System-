@@ -1,205 +1,367 @@
-# Main script using Google Drive API for downloads. Reads config from config.py
-# Improved version with better error handling and modularization.
-
-import face_recognition
-import cv2
-import numpy as np
-import gspread
-from google.oauth2.service_account import Credentials
-from googleapiclient.discovery import build
-from googleapiclient.errors import HttpError
-from googleapiclient.http import MediaIoBaseDownload
-from io import BytesIO
-import os
+import csv
 import time
-import json
-import google.generativeai as genai
-import PIL
-import re
+from datetime import datetime
+from pathlib import Path
 
-# --- Import Configuration ---
+import cv2
+import face_recognition
+import numpy as np
+
 try:
     import config
 except ImportError:
-    print("ERROR: config.py not found. Please create a config.py file with the required settings.")
-    exit()
-except Exception as config_err:
-    print(f"ERROR: Failed to import config.py.\nDetails: {config_err}")
-    exit()
+    print("ERROR: config.py not found.")
+    raise SystemExit(1)
+except Exception as exc:
+    print(f"ERROR: Failed to import config.py.\nDetails: {exc}")
+    raise SystemExit(1)
 
-# --- Load Configuration ---
-try:
-    SCOPES = getattr(config, 'GOOGLE_API_SCOPES', None)
-    CREDS_FILE = getattr(config, 'GOOGLE_CREDS_FILE', 'credentials.json')
-    SHEET_ID = getattr(config, 'GOOGLE_SHEET_ID', None)
-    SHEET_NAME = getattr(config, 'GOOGLE_SHEET_NAME', None)
-    WORKSHEET_NAME = getattr(config, 'GOOGLE_WORKSHEET_NAME', 'Sheet1')
-    SHEET_COLUMNS = getattr(config, 'SHEET_COLUMNS', None)
-    RECOGNITION_TOLERANCE = getattr(config, 'RECOGNITION_TOLERANCE', 0.55)
-    RESIZE_FACTOR = getattr(config, 'RESIZE_FACTOR', 0.25)
-    GEMINI_API_KEY = getattr(config, 'GEMINI_API_KEY', None)
-    GEMINI_PLACEHOLDER = "YOUR_GEMINI_API_KEY_HERE"
-    GEMINI_MODEL_NAME = 'gemini-1.5-flash-latest'
-except Exception as load_config_err:
-    print(f"ERROR: Failed to load variables from config.py.\nDetails: {load_config_err}")
-    exit()
 
-# --- Validate Essential Configuration ---
+BASE_DIR = Path(__file__).resolve().parent
+
+
+def resolve_path(value):
+    path = Path(value)
+    return path if path.is_absolute() else BASE_DIR / path
+
+
+OFFICER_DATABASE_CSV = resolve_path(
+    getattr(config, "OFFICER_DATABASE_CSV", "database/officers.csv")
+)
+OFFICER_IMAGES_DIR = resolve_path(
+    getattr(config, "OFFICER_IMAGES_DIR", "database/officers")
+)
+ALERTS_DIR = resolve_path(getattr(config, "ALERTS_DIR", "alerts"))
+CAMERA_INDEX = getattr(config, "CAMERA_INDEX", 0)
+CAMERA_BACKEND = getattr(config, "CAMERA_BACKEND", "DEFAULT").upper()
+CAMERA_FOURCC = getattr(config, "CAMERA_FOURCC", "MJPG")
+CAMERA_FPS = int(getattr(config, "CAMERA_FPS", 30))
+CAMERA_FRAME_WIDTH = int(getattr(config, "CAMERA_FRAME_WIDTH", 1280))
+CAMERA_FRAME_HEIGHT = int(getattr(config, "CAMERA_FRAME_HEIGHT", 720))
+RECOGNITION_TOLERANCE = getattr(config, "RECOGNITION_TOLERANCE", 0.48)
+RESIZE_FACTOR = getattr(config, "RESIZE_FACTOR", 0.25)
+FACE_DETECTION_UPSAMPLE = int(getattr(config, "FACE_DETECTION_UPSAMPLE", 1))
+FACE_DETECTION_MODEL = getattr(config, "FACE_DETECTION_MODEL", "hog")
+PROCESS_EVERY_N_FRAMES = int(getattr(config, "PROCESS_EVERY_N_FRAMES", 1))
+OFFICER_LABEL = getattr(config, "OFFICER_LABEL", "Officer")
+UNKNOWN_LABEL = getattr(config, "UNKNOWN_LABEL", "Unknown - Alert")
+ALERT_BANNER_TEXT = getattr(config, "ALERT_BANNER_TEXT", "ALERT: UNKNOWN PERSON DETECTED")
+UNKNOWN_ALERT_COOLDOWN_SECONDS = getattr(config, "UNKNOWN_ALERT_COOLDOWN_SECONDS", 8)
+SAVE_UNKNOWN_SNAPSHOTS = getattr(config, "SAVE_UNKNOWN_SNAPSHOTS", True)
+ENABLE_TERMINAL_BELL = getattr(config, "ENABLE_TERMINAL_BELL", True)
+AUTO_CLEAN_INVALID_SAMPLES = getattr(config, "AUTO_CLEAN_INVALID_SAMPLES", True)
+
+
 CONFIG_ERRORS = []
-if not SCOPES:
-    CONFIG_ERRORS.append("GOOGLE_API_SCOPES missing in config.py.")
-if not os.path.exists(CREDS_FILE):
-    CONFIG_ERRORS.append(f"Credentials file '{CREDS_FILE}' not found.")
-if not SHEET_ID and not SHEET_NAME:
-    CONFIG_ERRORS.append("Set GOOGLE_SHEET_ID or GOOGLE_SHEET_NAME in config.py.")
-if not SHEET_COLUMNS or not isinstance(SHEET_COLUMNS, dict) or "name" not in SHEET_COLUMNS or "image_url" not in SHEET_COLUMNS:
-    CONFIG_ERRORS.append("SHEET_COLUMNS invalid/missing in config.py.")
-if not GEMINI_API_KEY or GEMINI_API_KEY == GEMINI_PLACEHOLDER:
-    CONFIG_ERRORS.append("GEMINI_API_KEY missing or set to placeholder in config.py.")
+if RECOGNITION_TOLERANCE <= 0:
+    CONFIG_ERRORS.append("RECOGNITION_TOLERANCE must be greater than 0.")
+if RESIZE_FACTOR <= 0 or RESIZE_FACTOR > 1:
+    CONFIG_ERRORS.append("RESIZE_FACTOR must be between 0 and 1.")
+if FACE_DETECTION_UPSAMPLE < 0:
+    CONFIG_ERRORS.append("FACE_DETECTION_UPSAMPLE must be 0 or greater.")
+if FACE_DETECTION_MODEL not in {"hog", "cnn"}:
+    CONFIG_ERRORS.append("FACE_DETECTION_MODEL must be 'hog' or 'cnn'.")
+if PROCESS_EVERY_N_FRAMES < 1:
+    CONFIG_ERRORS.append("PROCESS_EVERY_N_FRAMES must be 1 or greater.")
 
 if CONFIG_ERRORS:
     print("ERROR: Configuration issues found:")
-    for err in CONFIG_ERRORS:
-        print(f"- {err}")
-    exit()
+    for error in CONFIG_ERRORS:
+        print(f"- {error}")
+    raise SystemExit(1)
 
-# --- Gemini API Setup ---
-gemini_model = None
-if GEMINI_API_KEY and GEMINI_API_KEY != GEMINI_PLACEHOLDER:
-    try:
-        genai.configure(api_key=GEMINI_API_KEY)
-        gemini_model = genai.GenerativeModel(GEMINI_MODEL_NAME)
-        print(f"Gemini API configured successfully (Model: {GEMINI_MODEL_NAME}).")
-    except Exception as gemini_err:
-        print(f"ERROR: Failed to configure Gemini API. Q&A disabled.\nDetails: {gemini_err}")
 
-# --- Global Variables ---
-known_face_data = {}
-drive_id_regex = re.compile(r"(?:/d/|id=)([-\w]{25,})")
+known_face_data = []
 
-# --- Functions ---
-def load_known_faces_from_sheet():
-    """
-    Reads the target Google Sheet, downloads images via Drive API, and encodes faces.
-    """
-    global known_face_data, drive_id_regex
-    print("\nConnecting to Google APIs & loading known faces...")
-    service_account_email, spreadsheet, creds, drive_service = None, None, None, None
 
-    # --- Authorize and Build Services ---
-    try:
-        creds = Credentials.from_service_account_file(CREDS_FILE, scopes=SCOPES)
-        client = gspread.authorize(creds)
-        drive_service = build('drive', 'v3', credentials=creds)
+def open_camera():
+    backend = cv2.CAP_V4L2 if CAMERA_BACKEND == "V4L2" and hasattr(cv2, "CAP_V4L2") else cv2.CAP_ANY
+    video_capture = cv2.VideoCapture(CAMERA_INDEX, backend)
+    if not video_capture.isOpened():
+        return video_capture
 
-        # --- Open Target Sheet ---
-        if SHEET_ID:
-            spreadsheet = client.open_by_key(SHEET_ID)
-        elif SHEET_NAME:
-            spreadsheet = client.open(SHEET_NAME)
-        else:
-            raise ValueError("Sheet ID or Name not configured")
+    if CAMERA_FOURCC and len(CAMERA_FOURCC) == 4:
+        video_capture.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*CAMERA_FOURCC))
+    if CAMERA_FPS > 0:
+        video_capture.set(cv2.CAP_PROP_FPS, CAMERA_FPS)
+    video_capture.set(cv2.CAP_PROP_FRAME_WIDTH, CAMERA_FRAME_WIDTH)
+    video_capture.set(cv2.CAP_PROP_FRAME_HEIGHT, CAMERA_FRAME_HEIGHT)
+    return video_capture
 
-        sheet = spreadsheet.worksheet(WORKSHEET_NAME)
-    except Exception as e_setup:
-        print(f"ERROR during API setup/Sheet connection.\nDetails: {e_setup}")
+
+def ensure_runtime_directories():
+    OFFICER_IMAGES_DIR.mkdir(parents=True, exist_ok=True)
+    ALERTS_DIR.mkdir(parents=True, exist_ok=True)
+
+
+def rewrite_database_csv(rows):
+    with OFFICER_DATABASE_CSV.open("w", newline="", encoding="utf-8") as csv_file:
+        writer = csv.DictWriter(csv_file, fieldnames=["name", "image_file", "badge_id"])
+        writer.writeheader()
+        writer.writerows(rows)
+
+
+def load_officer_database():
+    global known_face_data
+
+    ensure_runtime_directories()
+
+    if not OFFICER_DATABASE_CSV.exists():
+        print(f"ERROR: Officer database CSV not found: {OFFICER_DATABASE_CSV}")
         return False
 
-    # --- Fetching Sheet Data ---
-    try:
-        records = sheet.get_all_records()
-        if not records:
-            print("INFO: No data records to process.")
-            return True
-
-        header = list(records[0].keys())
-        missing_cols = [col for col in SHEET_COLUMNS.values() if col not in header]
-        if missing_cols:
-            print(f"ERROR: Missing columns in header: {missing_cols}. Check config.py & sheet.")
+    with OFFICER_DATABASE_CSV.open("r", newline="", encoding="utf-8") as csv_file:
+        reader = csv.DictReader(csv_file)
+        if reader.fieldnames is None:
+            print("ERROR: Officer database CSV is empty.")
             return False
-    except Exception as e_fetch:
-        print(f"ERROR reading sheet data.\nDetails: {e_fetch}")
+
+        required_columns = {"name", "image_file"}
+        missing_columns = required_columns.difference({name.strip() for name in reader.fieldnames})
+        if missing_columns:
+            print(
+                "ERROR: Officer database CSV must contain these headers: "
+                "name,image_file[,badge_id]"
+            )
+            print(f"Missing headers: {sorted(missing_columns)}")
+            return False
+
+        loaded_profiles = []
+        cleaned_rows = []
+        invalid_entries_found = False
+        for line_number, row in enumerate(reader, start=2):
+            name = str(row.get("name", "")).strip()
+            image_file = str(row.get("image_file", "")).strip()
+            badge_id = str(row.get("badge_id", "")).strip()
+
+            if not name or not image_file:
+                print(f"Skipping line {line_number}: missing name or image_file.")
+                invalid_entries_found = True
+                continue
+
+            image_path = Path(image_file)
+            if not image_path.is_absolute():
+                image_path = OFFICER_IMAGES_DIR / image_file
+
+            if not image_path.exists():
+                print(f"Skipping {name}: image not found at {image_path}")
+                invalid_entries_found = True
+                continue
+
+            try:
+                image = face_recognition.load_image_file(str(image_path))
+                encodings = face_recognition.face_encodings(image)
+            except Exception as exc:
+                print(f"Skipping {name}: failed to read image. Details: {exc}")
+                invalid_entries_found = True
+                if AUTO_CLEAN_INVALID_SAMPLES:
+                    try:
+                        image_path.unlink(missing_ok=True)
+                    except Exception:
+                        pass
+                continue
+
+            if not encodings:
+                print(f"Skipping {name}: no face found in {image_path.name}")
+                invalid_entries_found = True
+                if AUTO_CLEAN_INVALID_SAMPLES:
+                    try:
+                        image_path.unlink(missing_ok=True)
+                    except Exception:
+                        pass
+                continue
+
+            cleaned_rows.append(
+                {
+                    "name": name,
+                    "image_file": image_file,
+                    "badge_id": badge_id,
+                }
+            )
+            loaded_profiles.append(
+                {
+                    "name": name,
+                    "badge_id": badge_id,
+                    "encoding": encodings[0],
+                }
+            )
+
+    if AUTO_CLEAN_INVALID_SAMPLES and invalid_entries_found:
+        rewrite_database_csv(cleaned_rows)
+        print("Cleaned invalid sample entries from the officer database CSV.")
+
+    known_face_data = loaded_profiles
+    if not known_face_data:
+        print("ERROR: No valid officer face encodings were loaded.")
         return False
 
-    # --- Process Records ---
-    local_known_face_data = {}
-    for index, row in enumerate(records):
-        name = row.get(SHEET_COLUMNS["name"], "").strip()
-        original_url = row.get(SHEET_COLUMNS["image_url"], "").strip()
-
-        if not name or not original_url:
-            continue
-
-        match = drive_id_regex.search(original_url)
-        if not match:
-            continue
-        file_id = match.group(1)
-
-        try:
-            request = drive_service.files().get_media(fileId=file_id)
-            fh = BytesIO()
-            downloader = MediaIoBaseDownload(fh, request)
-            done = False
-            while not done:
-                _, done = downloader.next_chunk()
-
-            fh.seek(0)
-            image = face_recognition.load_image_file(fh)
-            face_encodings = face_recognition.face_encodings(image)
-
-            if face_encodings:
-                encoding = face_encodings[0]
-                local_known_face_data[name] = {'encoding': encoding}
-        except Exception:
-            continue
-
-    known_face_data = local_known_face_data
+    print(f"Loaded {len(known_face_data)} officer face profiles.")
     return True
 
-def run_recognition():
-    """
-    Runs the face recognition loop using the webcam.
-    """
-    global known_face_data
-    known_encodings_list = [d['encoding'] for d in known_face_data.values()]
-    known_names_list = list(known_face_data.keys())
 
-    video_capture = cv2.VideoCapture(0)
+def identify_face(face_encoding):
+    known_encodings = [profile["encoding"] for profile in known_face_data]
+    distances = face_recognition.face_distance(known_encodings, face_encoding)
+    best_match_index = int(np.argmin(distances))
+    best_distance = float(distances[best_match_index])
+
+    if best_distance <= RECOGNITION_TOLERANCE:
+        matched = known_face_data[best_match_index]
+        return {
+            "matched": True,
+            "name": matched["name"],
+            "badge_id": matched["badge_id"],
+            "label": OFFICER_LABEL,
+        }
+
+    return {
+        "matched": False,
+        "name": "Unknown",
+        "badge_id": "",
+        "label": UNKNOWN_LABEL,
+    }
+
+
+def save_unknown_snapshot(frame):
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    image_path = ALERTS_DIR / f"unknown_{timestamp}.jpg"
+    cv2.imwrite(str(image_path), frame)
+    return image_path
+
+
+def trigger_unknown_alert(frame, unknown_count):
+    if ENABLE_TERMINAL_BELL:
+        print("\a", end="", flush=True)
+
+    snapshot_message = ""
+    if SAVE_UNKNOWN_SNAPSHOTS:
+        image_path = save_unknown_snapshot(frame)
+        snapshot_message = f" Snapshot saved: {image_path}"
+
+    print(
+        f"[ALERT] {unknown_count} unknown face(s) detected at "
+        f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}.{snapshot_message}"
+    )
+
+
+def draw_face_label(frame, face_box, profile):
+    top, right, bottom, left = face_box
+    is_match = profile["matched"]
+    box_color = (0, 180, 0) if is_match else (0, 0, 255)
+
+    cv2.rectangle(frame, (left, top), (right, bottom), box_color, 2)
+
+    lines = [profile["name"], profile["label"]]
+    if profile["badge_id"]:
+        lines.append(f"ID: {profile['badge_id']}")
+
+    panel_height = 24 * len(lines) + 10
+    panel_top = max(top - panel_height, 0)
+    cv2.rectangle(frame, (left, panel_top), (right, top), box_color, cv2.FILLED)
+
+    for index, text in enumerate(lines):
+        y = panel_top + 20 + (index * 22)
+        cv2.putText(
+            frame,
+            text,
+            (left + 6, y),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.55,
+            (255, 255, 255),
+            1,
+            cv2.LINE_AA,
+        )
+
+
+def draw_alert_banner(frame, unknown_count):
+    banner_height = 52
+    overlay = frame.copy()
+    cv2.rectangle(overlay, (0, 0), (frame.shape[1], banner_height), (0, 0, 255), -1)
+    cv2.addWeighted(overlay, 0.35, frame, 0.65, 0, frame)
+    cv2.putText(
+        frame,
+        ALERT_BANNER_TEXT,
+        (12, 22),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.65,
+        (255, 255, 255),
+        2,
+        cv2.LINE_AA,
+    )
+    cv2.putText(
+        frame,
+        f"Unknown faces: {unknown_count}",
+        (12, 44),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.55,
+        (255, 255, 255),
+        1,
+        cv2.LINE_AA,
+    )
+
+
+def run_recognition():
+    video_capture = open_camera()
     if not video_capture.isOpened():
-        print("ERROR: No video capture device found.")
+        print("ERROR: Could not open the webcam.")
         return
 
+    last_unknown_alert_at = 0.0
+    frame_counter = 0
+    last_results = []
     print("Press 'q' to quit.")
+
     while True:
-        ret, frame = video_capture.read()
-        if not ret:
+        ok, frame = video_capture.read()
+        if not ok:
             continue
 
-        rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        face_locations = face_recognition.face_locations(rgb_frame)
-        face_encodings = face_recognition.face_encodings(rgb_frame, face_locations)
+        if frame_counter % PROCESS_EVERY_N_FRAMES == 0:
+            small_frame = cv2.resize(frame, (0, 0), fx=RESIZE_FACTOR, fy=RESIZE_FACTOR)
+            rgb_small_frame = cv2.cvtColor(small_frame, cv2.COLOR_BGR2RGB)
+            face_locations = face_recognition.face_locations(
+                rgb_small_frame,
+                number_of_times_to_upsample=FACE_DETECTION_UPSAMPLE,
+                model=FACE_DETECTION_MODEL,
+            )
+            face_encodings = face_recognition.face_encodings(rgb_small_frame, face_locations)
 
-        for (top, right, bottom, left), face_encoding in zip(face_locations, face_encodings):
-            matches = face_recognition.compare_faces(known_encodings_list, face_encoding, tolerance=RECOGNITION_TOLERANCE)
-            name = "Unknown"
+            refreshed_results = []
+            for (top, right, bottom, left), face_encoding in zip(face_locations, face_encodings):
+                profile = identify_face(face_encoding)
+                scaled_box = (
+                    int(top / RESIZE_FACTOR),
+                    int(right / RESIZE_FACTOR),
+                    int(bottom / RESIZE_FACTOR),
+                    int(left / RESIZE_FACTOR),
+                )
+                refreshed_results.append((scaled_box, profile))
+            last_results = refreshed_results
 
-            if True in matches:
-                first_match_index = matches.index(True)
-                name = known_names_list[first_match_index]
+        unknown_count = 0
+        for scaled_box, profile in last_results:
+            draw_face_label(frame, scaled_box, profile)
+            if not profile["matched"]:
+                unknown_count += 1
 
-            cv2.rectangle(frame, (left, top), (right, bottom), (0, 255, 0), 2)
-            cv2.putText(frame, name, (left, top - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+        if unknown_count > 0:
+            draw_alert_banner(frame, unknown_count)
+            now = time.monotonic()
+            if now - last_unknown_alert_at >= UNKNOWN_ALERT_COOLDOWN_SECONDS:
+                trigger_unknown_alert(frame, unknown_count)
+                last_unknown_alert_at = now
 
-        cv2.imshow('Video', frame)
-        if cv2.waitKey(1) & 0xFF == ord('q'):
+        cv2.imshow("Officer Face Recognition", frame)
+        if cv2.waitKey(1) & 0xFF == ord("q"):
             break
+        frame_counter += 1
 
     video_capture.release()
     cv2.destroyAllWindows()
 
-# --- Main Execution ---
+
 if __name__ == "__main__":
-    if load_known_faces_from_sheet():
+    if load_officer_database():
         run_recognition()
     else:
-        print("Exiting: Failed to load known faces.")
+        print("Exiting: failed to load officer face database.")

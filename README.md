@@ -1,78 +1,112 @@
-# Face Recognition System with Google Sheets Integration
+# Officer Face Recognition Alert System
 
-This project implements a face recognition system using the `face_recognition` library and integrates with Google Sheets to manage known faces. It leverages the Google Drive API to download images of known individuals stored in a Google Sheet and uses these images to train the face recognition model.  The system then uses a webcam to perform real-time face recognition, identifying known faces based on the data in the Google Sheet.
+This version keeps face detection and face recognition as the primary feature.
 
-## Key Features
+The system:
 
-*   **Face Recognition:** Uses the `face_recognition` library for accurate and efficient face detection and recognition.
-*   **Google Sheets Integration:** Reads names and image URLs from a Google Sheet to populate the known faces database.  Supports both Sheet ID and Sheet Name for configuration.
-*   **Google Drive API:** Downloads images from Google Drive using the provided URLs.  Handles authentication and authorization through a service account.
-*   **Real-time Recognition:** Processes webcam footage to identify faces in real-time.
-*   **Configurable Tolerance:** Allows adjusting the recognition tolerance for fine-tuning accuracy.
-*   **Modular Design:**  Separates configuration loading, data fetching, and recognition logic for improved maintainability.
-*   **Error Handling:** Includes robust error handling to manage potential issues with API connections, file downloads, and data processing.
+- loads a local database of officer face images
+- matches webcam faces against that officer database
+- labels matched people as `Officer`
+- labels non-matched people as `Possible Trespassing Civilian`
+- raises an alert banner and stores a snapshot when an unknown face is seen
 
-## Prerequisites
+## Folder structure
 
-*   Python 3.6 or higher
-*   A Google Cloud project with the Google Drive API and Google Sheets API enabled.
-*   A Google service account with access to the Google Sheet and Google Drive folder containing the images.
-*   A `credentials.json` file containing the service account credentials.
-*   A Google Sheet containing a list of names and corresponding Google Drive image URLs.
-*   Libraries listed in `requirements.txt`.
+```text
+Face-Recognition-System--main/
+  face_recognizer.py
+  enroll_officer.py
+  config.py
+  database/
+    officers.csv
+    officers/
+      officer_1.jpg
+      officer_2.jpg
+  alerts/
+```
 
-## Installation
+## Better enrollment flow
 
-1.  Clone the repository:
+Instead of manually collecting many selfies, use the guided enrollment script:
 
-    ```bash
-    git clone <repository_url>
-    cd face-recognition-google-sheets
-    ```
+```bash
+python enroll_officer.py
+```
 
-2.  Create a virtual environment (optional but recommended):
+It will ask for:
 
-    ```bash
-    python -m venv venv
-    source venv/bin/activate  # On Linux/macOS
-    venv\Scripts\activate  # On Windows
-    ```
+- officer name
+- badge ID
 
-3.  Install the required packages:
+Then it opens the webcam and guides the officer through these poses:
 
-    ```bash
-    pip install -r requirements.txt
-    ```
+- center
+- left
+- right
+- up
+- down
 
-4.  Configure the project:
+For each pose it now waits until the detected face orientation matches the requested pose, then captures several face crops automatically, saves them under a badge-specific folder inside [database/officers](/home/aiml/Desktop/Face-Recognition-System--main/database/officers), and updates [database/officers.csv](/home/aiml/Desktop/Face-Recognition-System--main/database/officers.csv).
 
-    *   Create a `config.py` file (or modify the existing `config_example.py`) and set the following variables:
+If the entered badge ID is already present in the database, the script shows that the officer is already enrolled and stops instead of recording duplicate samples.
 
-        *   `GOOGLE_API_SCOPES`: The required Google API scopes.
-        *   `GOOGLE_CREDS_FILE`: The path to your `credentials.json` file.
-        *   `GOOGLE_SHEET_ID` or `GOOGLE_SHEET_NAME`:  The ID or name of your Google Sheet.
-        *   `WORKSHEET_NAME`:  The name of the worksheet within the Google Sheet.
-        *   `SHEET_COLUMNS`: A dictionary mapping column names in the sheet to the expected data (e.g., `{"name": "Name", "image_url": "Image URL"}`).
-        *   `RECOGNITION_TOLERANCE`: The face recognition tolerance.
+The enrollment step now also validates each captured crop before saving it, so obviously bad samples are rejected earlier.
 
-5.  Run the script:
+This is the recommended way to build the face database.
 
-    ```bash
-    python main.py
-    ```
+## Officer database CSV
 
-## Configuration
+The file [database/officers.csv](/home/aiml/Desktop/Face-Recognition-System--main/database/officers.csv) must contain:
 
-The `config.py` file is used to configure the project.  Refer to the `config_example.py` file for an example configuration.  Ensure that the service account has the necessary permissions to access the Google Sheet and Google Drive files.
+```csv
+name,image_file,badge_id
+Ravi Kumar,RG-101/center_01.jpg,RG-101
+Ravi Kumar,RG-101/left_01.jpg,RG-101
+Ravi Kumar,RG-101/right_01.jpg,RG-101
+```
 
-## Usage
+Put the matching image files inside [database/officers](/home/aiml/Desktop/Face-Recognition-System--main/database/officers).
 
-Once the script is running, it will access your webcam and attempt to identify faces based on the data in your Google Sheet.  Press `q` to quit the application.
+## Setup
 
-## Contributing
+Install the required packages:
 
-Contributions are welcome! Please submit pull requests with bug fixes, new features, or improvements to the documentation.
+```bash
+pip install face_recognition opencv-python numpy
+```
 
-## License
+Then either:
 
-This project is licensed under the [MIT License](LICENSE).
+- use `python enroll_officer.py` to generate entries automatically
+- or add rows manually if needed
+
+If distant faces are not detected well enough, tune these values in [config.py](/home/aiml/Desktop/Face-Recognition-System--main/config.py):
+
+- `CAMERA_FRAME_WIDTH`
+- `CAMERA_FRAME_HEIGHT`
+- `RESIZE_FACTOR`
+- `FACE_DETECTION_UPSAMPLE`
+- `PROCESS_EVERY_N_FRAMES`
+
+Higher resolution and higher upsample improve distant-face detection, but they also make processing slower.
+Higher `PROCESS_EVERY_N_FRAMES` improves FPS by running full detection less often.
+
+## Run
+
+```bash
+python face_recognizer.py
+```
+
+Press `q` to quit.
+
+## What happens on unknown faces
+
+If a face is not found in the officer database:
+
+- the face box turns red
+- the screen shows an alert banner
+- a snapshot is saved in [alerts](/home/aiml/Desktop/Face-Recognition-System--main/alerts)
+
+If invalid sample images are still present in the database, the recognizer removes those broken entries from the CSV automatically when `AUTO_CLEAN_INVALID_SAMPLES = True` in [config.py](/home/aiml/Desktop/Face-Recognition-System--main/config.py).
+
+Weapon detection is intentionally not part of this step. Get face recognition stable first, then add weapon detection as a second stage.
